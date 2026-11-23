@@ -1,0 +1,986 @@
+   1 | #!/usr/bin/env python3
+   2 | """Nexus Distributed Grid Telemetry & Synthetic Load Orchestrator."""
+   3 | 
+   4 | from __future__ import annotations
+   5 | 
+   6 | import argparse
+   7 | import asyncio
+   8 | import hashlib
+   9 | import json
+  10 | import logging
+  11 | import math
+  12 | import os
+  13 | import random
+  14 | import signal
+  15 | import sys
+  16 | import time
+  17 | import uuid
+  18 | from collections import deque
+  19 | from dataclasses import asdict, dataclass, field
+  20 | from datetime import datetime, timezone
+  21 | from enum import Enum
+  22 | from pathlib import Path
+  23 | from typing import Any, Callable, Coroutine, Deque, Dict, Iterable, List, Optional, Tuple
+  24 | 
+  25 | DEFAULT_REGION = "ap-south-1"
+  26 | DEFAULT_TICK_MS = 250
+  27 | DEFAULT_BATCH_SIZE = 64
+  28 | DEFAULT_MAX_QUEUE = 4096
+  29 | DEFAULT_SEED = 20261124
+  30 | SCHEMA_VERSION = "4.8.2"
+  31 | 
+  32 | LOGGER = logging.getLogger("nexus.grid.orchestrator")
+  33 | 
+  34 | 
+  35 | class NodeState(str, Enum):
+  36 |     BOOTING = "BOOTING"
+  37 |     HEALTHY = "HEALTHY"
+  38 |     DEGRADED = "DEGRADED"
+  39 |     DRAINING = "DRAINING"
+  40 |     OFFLINE = "OFFLINE"
+  41 |     QUARANTINED = "QUARANTINED"
+  42 | 
+  43 | 
+  44 | class AlertSeverity(str, Enum):
+  45 |     INFO = "INFO"
+  46 |     WARN = "WARN"
+  47 |     ERROR = "ERROR"
+  48 |     CRITICAL = "CRITICAL"
+  49 | 
+  50 | 
+  51 | class WorkloadProfile(str, Enum):
+  52 |     STEADY = "STEADY"
+  53 |     DIURNAL = "DIURNAL"
+  54 |     BURSTY = "BURSTY"
+  55 |     CHAOS = "CHAOS"
+  56 | 
+  57 | 
+  58 | @dataclass
+  59 | class GridConfig:
+  60 |     region: str = DEFAULT_REGION
+  61 |     node_count: int = 24
+  62 |     tick_ms: int = DEFAULT_TICK_MS
+  63 |     batch_size: int = DEFAULT_BATCH_SIZE
+  64 |     max_queue: int = DEFAULT_MAX_QUEUE
+  65 |     seed: int = DEFAULT_SEED
+  66 |     profile: WorkloadProfile = WorkloadProfile.DIURNAL
+  67 |     latency_sla_ms: float = 145.0
+  68 |     error_budget_pct: float = 0.50
+  69 |     enable_auto_rebalance: bool = True
+  70 |     enable_circuit_breakers: bool = True
+  71 |     snapshot_interval_ticks: int = 20
+  72 |     output_path: Optional[Path] = None
+  73 | 
+  74 |     def validate(self) -> None:
+  75 |         if self.node_count < 1:
+  76 |             raise ValueError("node_count must be >= 1")
+  77 |         if self.tick_ms < 10:
+  78 |             raise ValueError("tick_ms must be >= 10")
+  79 |         if self.batch_size < 1:
+  80 |             raise ValueError("batch_size must be >= 1")
+  81 |         if self.max_queue < self.batch_size:
+  82 |             raise ValueError("max_queue must be >= batch_size")
+  83 |         if not (0.0 <= self.error_budget_pct <= 100.0):
+  84 |             raise ValueError("error_budget_pct must be between 0 and 100")
+  85 | 
+  86 | 
+  87 | @dataclass
+  88 | class TelemetryFrame:
+  89 |     frame_id: str
+  90 |     node_id: str
+  91 |     zone: str
+  92 |     timestamp_utc: str
+  93 |     tick: int
+  94 |     cpu_pct: float
+  95 |     mem_pct: float
+  96 |     queue_depth: int
+  97 |     rps: float
+  98 |     p50_ms: float
+  99 |     p99_ms: float
+ 100 |     error_rate_pct: float
+ 101 |     state: NodeState
+ 102 |     checksum: str = ""
+ 103 | 
+ 104 |     def compute_checksum(self) -> str:
+ 105 |         payload = (
+ 106 |             f"{self.frame_id}|{self.node_id}|{self.tick}|"
+ 107 |             f"{self.cpu_pct:.3f}|{self.mem_pct:.3f}|{self.queue_depth}|"
+ 108 |             f"{self.rps:.2f}|{self.p99_ms:.2f}|{self.error_rate_pct:.4f}|{self.state.value}"
+ 109 |         )
+ 110 |         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+ 111 | 
+ 112 |     def finalize(self) -> "TelemetryFrame":
+ 113 |         self.checksum = self.compute_checksum()
+ 114 |         return self
+ 115 | 
+ 116 | 
+ 117 | @dataclass
+ 118 | class AlertEvent:
+ 119 |     alert_id: str
+ 120 |     timestamp_utc: str
+ 121 |     tick: int
+ 122 |     node_id: str
+ 123 |     severity: AlertSeverity
+ 124 |     code: str
+ 125 |     message: str
+ 126 |     metric_value: float
+ 127 |     threshold: float
+ 128 | 
+ 129 | 
+ 130 | @dataclass
+ 131 | class RebalancePlan:
+ 132 |     plan_id: str
+ 133 |     tick: int
+ 134 |     source_node: str
+ 135 |     target_node: str
+ 136 |     weight_delta: float
+ 137 |     reason: str
+ 138 | 
+ 139 | 
+ 140 | @dataclass
+ 141 | class RingEntry:
+ 142 |     hash_slot: int
+ 143 |     node_id: str
+ 144 |     replica_idx: int
+ 145 | 
+ 146 | 
+ 147 | class ConsistentHashRing:
+ 148 |     """Consistent hash ring with virtual nodes for deterministic shard routing."""
+ 149 | 
+ 150 |     def __init__(self, replicas: int = 128) -> None:
+ 151 |         self.replicas = replicas
+ 152 |         self._entries: List[RingEntry] = []
+ 153 |         self._slots: List[int] = []
+ 154 |         self._node_weights: Dict[str, float] = {}
+ 155 | 
+ 156 |     @staticmethod
+ 157 |     def _hash_key(key: str) -> int:
+ 158 |         digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).digest()
+ 159 |         return int.from_bytes(digest, byteorder="big", signed=False)
+ 160 | 
+ 161 |     def add_node(self, node_id: str, weight: float = 1.0) -> None:
+ 162 |         self._node_weights[node_id] = max(0.05, weight)
+ 163 |         self._rebuild()
+ 164 | 
+ 165 |     def remove_node(self, node_id: str) -> None:
+ 166 |         self._node_weights.pop(node_id, None)
+ 167 |         self._rebuild()
+ 168 | 
+ 169 |     def set_weight(self, node_id: str, weight: float) -> None:
+ 170 |         if node_id in self._node_weights:
+ 171 |             self._node_weights[node_id] = max(0.05, weight)
+ 172 |             self._rebuild()
+ 173 | 
+ 174 |     def _rebuild(self) -> None:
+ 175 |         entries: List[RingEntry] = []
+ 176 |         for node_id, weight in sorted(self._node_weights.items()):
+ 177 |             vnodes = max(1, int(round(self.replicas * weight)))
+ 178 |             for idx in range(vnodes):
+ 179 |                 slot = self._hash_key(f"{node_id}#vnode-{idx}")
+ 180 |                 entries.append(RingEntry(hash_slot=slot, node_id=node_id, replica_idx=idx))
+ 181 |         entries.sort(key=lambda item: item.hash_slot)
+ 182 |         self._entries = entries
+ 183 |         self._slots = [item.hash_slot for item in entries]
+ 184 | 
+ 185 |     def lookup(self, partition_key: str) -> Optional[str]:
+ 190 |         if not self._entries:
+ 191 |             return None
+ 192 |         target = self._hash_key(partition_key)
+ 193 |         lo, hi = 0, len(self._slots)
+ 194 |         while lo < hi:
+ 195 |             mid = (lo + hi) // 2
+ 196 |             if self._slots[mid] < target:
+ 197 |                 lo = mid + 1
+ 198 |             else:
+ 199 |                 hi = mid
+ 200 |         idx = lo if lo < len(self._slots) else 0
+ 201 |         return self._entries[idx].node_id
+ 202 | 
+ 203 |     def distribution_stats(self) -> Dict[str, float]:
+ 204 |         if not self._entries:
+ 205 |             return {}
+ 206 |         counts: Dict[str, int] = {node: 0 for node in self._node_weights}
+ 207 |         for entry in self._entries:
+ 208 |             counts[entry.node_id] = counts.get(entry.node_id, 0) + 1
+ 209 |         total = len(self._entries)
+ 210 |         return {node: round((cnt / total) * 100.0, 2) for node, cnt in counts.items()}
+ 211 | 
+ 212 | 
+ 213 | class CircuitBreaker:
+ 214 |     """Per-node circuit breaker to isolate cascading timeouts and errors."""
+ 215 | 
+ 216 |     def __init__(
+ 217 |         self,
+ 218 |         failure_threshold: int = 5,
+ 219 |         recovery_ticks: int = 12,
+ 220 |         half_open_probes: int = 3,
+ 221 |     ) -> None:
+ 222 |         self.failure_threshold = failure_threshold
+ 223 |         self.recovery_ticks = recovery_ticks
+ 224 |         self.half_open_probes = half_open_probes
+ 225 |         self.state: str = "CLOSED"
+ 226 |         self.consecutive_failures: int = 0
+ 227 |         self.opened_at_tick: int = -1
+ 228 |         self.probe_successes: int = 0
+ 229 | 
+ 230 |     def allow_request(self, tick: int) -> bool:
+ 231 |         if self.state == "CLOSED":
+ 232 |             return True
+ 233 |         if self.state == "OPEN":
+ 234 |             if tick - self.opened_at_tick >= self.recovery_ticks:
+ 235 |                 self.state = "HALF_OPEN"
+ 236 |                 self.probe_successes = 0
+ 237 |                 return True
+ 238 |             return False
+ 239 |         return True
+ 240 | 
+ 241 |     def record_outcome(self, tick: int, success: bool) -> str:
+ 242 |         prev = self.state
+ 243 |         if success:
+ 244 |             self.consecutive_failures = 0
+ 245 |             if self.state == "HALF_OPEN":
+ 246 |                 self.probe_successes += 1
+ 247 |                 if self.probe_successes >= self.half_open_probes:
+ 248 |                     self.state = "CLOSED"
+ 249 |                     self.probe_successes = 0
+ 250 |         else:
+ 251 |             self.consecutive_failures += 1
+ 252 |             if self.state == "HALF_OPEN":
+ 253 |                 self.state = "OPEN"
+ 254 |                 self.opened_at_tick = tick
+ 255 |             elif self.state == "CLOSED" and self.consecutive_failures >= self.failure_threshold:
+ 256 |                 self.state = "OPEN"
+ 257 |                 self.opened_at_tick = tick
+ 258 |         return f"{prev}->{self.state}"
+ 259 | 
+ 260 | 
+ 261 | class ExponentialMovingWindow:
+ 262 |     """Bounded sliding window with EWMA and percentile approximations."""
+ 263 | 
+ 264 |     def __init__(self, maxlen: int = 120, alpha: float = 0.15) -> None:
+ 265 |         self.maxlen = maxlen
+ 266 |         self.alpha = alpha
+ 267 |         self.samples: Deque[float] = deque(maxlen=maxlen)
+ 268 |         self.ewma: Optional[float] = None
+ 269 | 
+ 270 |     def add(self, value: float) -> None:
+ 271 |         self.samples.append(value)
+ 272 |         if self.ewma is None:
+ 273 |             self.ewma = value
+ 274 |         else:
+ 275 |             self.ewma = (self.alpha * value) + ((1.0 - self.alpha) * self.ewma)
+ 276 | 
+ 277 |     def percentile(self, pct: float) -> float:
+ 278 |         if not self.samples:
+ 279 |             return 0.0
+ 280 |         ordered = sorted(self.samples)
+ 281 |         idx = int(round((pct / 100.0) * (len(ordered) - 1)))
+ 282 |         idx = max(0, min(len(ordered) - 1, idx))
+ 283 |         return ordered[idx]
+ 284 | 
+ 285 |     def mean(self) -> float:
+ 286 |         if not self.samples:
+ 287 |             return 0.0
+ 288 |         return sum(self.samples) / len(self.samples)
+ 289 | 
+ 290 | 
+ 291 | class GridNode:
+ 292 |     """Simulated compute/storage worker node emitting synthetic telemetry."""
+ 293 | 
+ 294 |     def __init__(
+ 295 |         self,
+ 296 |         node_id: str,
+ 297 |         zone: str,
+ 298 |         rng: random.Random,
+ 299 |         capacity_rps: float = 1200.0,
+ 300 |     ) -> None:
+ 301 |         self.node_id = node_id
+ 302 |         self.zone = zone
+ 303 |         self.rng = rng
+ 304 |         self.capacity_rps = capacity_rps
+ 305 |         self.weight: float = 1.0
+ 306 |         self.state: NodeState = NodeState.BOOTING
+ 307 |         self.cpu_pct: float = 14.0
+ 308 |         self.mem_pct: float = 32.0
+ 309 |         self.queue_depth: int = 0
+ 310 |         self.rps: float = 0.0
+ 311 |         self.p50_ms: float = 12.0
+ 312 |         self.p99_ms: float = 48.0
+ 313 |         self.error_rate_pct: float = 0.01
+ 314 |         self.ticks_in_state: int = 0
+ 315 |         self.total_requests: int = 0
+ 316 |         self.total_errors: int = 0
+ 317 |         self.breaker = CircuitBreaker()
+ 318 |         self.latency_win = ExponentialMovingWindow(maxlen=120, alpha=0.18)
+ 319 |         self.cpu_win = ExponentialMovingWindow(maxlen=120, alpha=0.12)
+ 320 | 
+ 321 |     def transition_to(self, new_state: NodeState) -> None:
+ 322 |         if self.state != new_state:
+ 323 |             self.state = new_state
+ 324 |             self.ticks_in_state = 0
+ 325 | 
+ 326 |     def _demand_multiplier(self, tick: int, profile: WorkloadProfile) -> float:
+ 327 |         if profile == WorkloadProfile.STEADY:
+ 328 |             return 0.55 + self.rng.uniform(-0.04, 0.04)
+ 329 |         if profile == WorkloadProfile.DIURNAL:
+ 330 |             phase = (tick % 240) / 240.0 * 2.0 * math.pi
+ 331 |             wave = 0.55 + 0.35 * math.sin(phase - math.pi / 3.0)
+ 332 |             return max(0.12, wave + self.rng.uniform(-0.05, 0.05))
+ 333 |         if profile == WorkloadProfile.BURSTY:
+ 334 |             burst = 1.45 if (tick % 45) < 7 else 0.42
+ 335 |             return max(0.10, burst + self.rng.uniform(-0.08, 0.12))
+ 336 |         if profile == WorkloadProfile.CHAOS:
+ 337 |             spike = 1.85 if self.rng.random() < 0.14 else 0.65
+ 338 |             return max(0.10, spike + self.rng.uniform(-0.15, 0.25))
+ 339 |         return 0.50
+ 340 | 
+ 341 |     def step(self, tick: int, dt_sec: float, profile: WorkloadProfile) -> TelemetryFrame:
+ 342 |         self.ticks_in_state += 1
+ 343 |         if self.state == NodeState.BOOTING and self.ticks_in_state >= 4:
+ 344 |             self.transition_to(NodeState.HEALTHY)
+ 345 | 
+ 346 |         if self.state == NodeState.QUARANTINED and self.ticks_in_state >= 24:
+ 347 |             self.transition_to(NodeState.DRAINING)
+ 348 |         elif self.state == NodeState.DRAINING and self.ticks_in_state >= 8:
+ 349 |             self.transition_to(NodeState.HEALTHY)
+ 350 | 
+ 351 |         demand = self._demand_multiplier(tick, profile)
+ 352 |         effective_cap = self.capacity_rps * self.weight
+ 353 | 
+ 354 |         if self.state in (NodeState.OFFLINE, NodeState.QUARANTINED):
+ 355 |             target_rps = 0.0
+ 356 |         elif self.state == NodeState.DRAINING:
+ 357 |             target_rps = effective_cap * demand * 0.25
+ 358 |         else:
+ 359 |             target_rps = effective_cap * demand
+ 360 | 
+ 361 |         allowed = self.breaker.allow_request(tick)
+ 362 |         if not allowed:
+ 363 |             target_rps *= 0.05
+ 364 | 
+ 365 |         self.rps = round((0.72 * self.rps) + (0.28 * target_rps), 2)
+ 366 |         utilization = min(1.45, self.rps / max(1.0, effective_cap))
+ 367 | 
+ 368 |         overload = max(0.0, utilization - 0.85)
+ 369 |         incoming_backlog = int(max(0.0, (self.rps - effective_cap * 0.90) * dt_sec * 4.0))
+ 370 |         drained = int(self.queue_depth * 0.35) + (0 if overload > 0.15 else 12)
+ 371 |         self.queue_depth = max(0, min(5000, self.queue_depth + incoming_backlog - drained))
+ 372 | 
+ 373 |         target_cpu = 12.0 + (utilization * 68.0) + (overload * 45.0) + self.rng.uniform(-2.5, 2.5)
+ 374 |         self.cpu_pct = round(max(2.0, min(99.9, (0.75 * self.cpu_pct) + (0.25 * target_cpu))), 2)
+ 375 | 
+ 376 |         mem_drift = (utilization - 0.50) * 1.4 + self.rng.uniform(-0.4, 0.45)
+ 377 |         self.mem_pct = round(max(18.0, min(96.5, self.mem_pct + mem_drift)), 2)
+ 378 | 
+ 379 |         base_p50 = 10.5 + (utilization ** 2) * 28.0 + (self.queue_depth * 0.04)
+ 380 |         self.p50_ms = round(max(4.0, base_p50 + self.rng.uniform(-1.8, 2.2)), 2)
+ 381 | 
+ 382 |         tail_penalty = (overload ** 2.4) * 420.0 + (self.queue_depth * 0.19)
+ 383 |         raw_p99 = (self.p50_ms * 3.4) + tail_penalty + self.rng.uniform(-6.0, 14.0)
+ 384 |         self.p99_ms = round(max(self.p50_ms + 5.0, min(2500.0, raw_p99)), 2)
+ 385 | 
+ 386 |         err_base = 0.015 + (overload ** 2.0) * 6.5
+ 387 |         if self.state == NodeState.DEGRADED:
+ 388 |             err_base += 0.35
+ 389 |         self.error_rate_pct = round(max(0.0, min(25.0, err_base + self.rng.uniform(-0.01, 0.04))), 4)
+ 380 | 
+ 391 |         reqs_this_tick = int(self.rps * dt_sec)
+ 392 |         errs_this_tick = int(round(reqs_this_tick * (self.error_rate_pct / 100.0)))
+ 393 |         self.total_requests += reqs_this_tick
+ 394 |         self.total_errors += errs_this_tick
+ 395 | 
+ 396 |         success_tick = (self.p99_ms < 450.0) and (self.error_rate_pct < 2.0)
+ 397 |         self.breaker.record_outcome(tick, success_tick)
+ 398 | 
+ 399 |         if self.state not in (NodeState.BOOTING, NodeState.OFFLINE, NodeState.QUARANTINED, NodeState.DRAINING):
+ 400 |             if self.cpu_pct > 92.0 or self.error_rate_pct > 4.5 or self.breaker.state == "OPEN":
+ 401 |                 self.transition_to(NodeState.QUARANTINED)
+ 402 |             elif self.cpu_pct > 78.0 or self.p99_ms > 220.0 or self.error_rate_pct > 0.8:
+ 403 |                 self.transition_to(NodeState.DEGRADED)
+ 404 |             else:
+ 405 |                 self.transition_to(NodeState.HEALTHY)
+ 406 | 
+ 407 |         self.latency_win.add(self.p99_ms)
+ 408 |         self.cpu_win.add(self.cpu_pct)
+ 409 | 
+ 410 |         now_iso = datetime.now(timezone.utc).isoformat()
+ 411 |         frame = TelemetryFrame(
+ 412 |             frame_id=f"frm-{tick:06d}-{self.node_id}",
+ 413 |             node_id=self.node_id,
+ 414 |             zone=self.zone,
+ 415 |             timestamp_utc=now_iso,
+ 416 |             tick=tick,
+ 417 |             cpu_pct=self.cpu_pct,
+ 418 |             mem_pct=self.mem_pct,
+ 419 |             queue_depth=self.queue_depth,
+ 420 |             rps=self.rps,
+ 421 |             p50_ms=self.p50_ms,
+ 422 |             p99_ms=self.p99_ms,
+ 423 |             error_rate_pct=self.error_rate_pct,
+ 424 |             state=self.state,
+ 425 |         )
+ 426 |         return frame.finalize()
+ 427 | 
+ 428 | 
+ 429 | class AlertEngine:
+ 430 |     """Evaluates telemetry frames against SLA thresholds with deduplication cooldowns."""
+ 431 | 
+ 432 |     def __init__(self, latency_sla_ms: float, error_budget_pct: float, cooldown_ticks: int = 8) -> None:
+ 433 |         self.latency_sla_ms = latency_sla_ms
+ 434 |         self.error_budget_pct = error_budget_pct
+ 435 |         self.cooldown_ticks = cooldown_ticks
+ 436 |         self._last_fired: Dict[Tuple[str, str], int] = {}
+ 437 |         self.history: List[AlertEvent] = []
+ 438 | 
+ 439 |     def _can_emit(self, node_id: str, code: str, tick: int) -> bool:
+ 440 |         key = (node_id, code)
+ 441 |         prev = self._last_fired.get(key)
+ 442 |         if prev is not None and (tick - prev) < self.cooldown_ticks:
+ 443 |             return False
+ 444 |         self._last_fired[key] = tick
+ 445 |         return True
+ 446 | 
+ 447 |     def evaluate(self, frame: TelemetryFrame) -> List[AlertEvent]:
+ 448 |         emitted: List[AlertEvent] = []
+ 449 |         checks: List[Tuple[bool, AlertSeverity, str, str, float, float]] = [
+ 450 |             (
+ 451 |                 frame.p99_ms > self.latency_sla_ms * 1.5,
+ 452 |                 AlertSeverity.CRITICAL,
+ 453 |                 "LATENCY_SLA_BREACH_CRIT",
+ 454 |                 f"p99 latency {frame.p99_ms:.1f}ms exceeded 1.5x SLA",
+ 455 |                 frame.p99_ms,
+ 456 |                 self.latency_sla_ms * 1.5,
+ 457 |             ),
+ 458 |             (
+ 459 |                 frame.p99_ms > self.latency_sla_ms and frame.p99_ms <= self.latency_sla_ms * 1.5,
+ 460 |                 AlertSeverity.WARN,
+ 461 |                 "LATENCY_SLA_WARN",
+ 462 |                 f"p99 latency {frame.p99_ms:.1f}ms above SLA target",
+ 463 |                 frame.p99_ms,
+ 464 |                 self.latency_sla_ms,
+ 465 |             ),
+ 466 |             (
+ 467 |                 frame.error_rate_pct > self.error_budget_pct * 4.0,
+ 468 |                 AlertSeverity.ERROR,
+ 469 |                 "ERROR_BUDGET_BURN",
+ 470 |                 f"Error rate {frame.error_rate_pct:.2f}% burning error budget",
+ 471 |                 frame.error_rate_pct,
+ 472 |                 self.error_budget_pct * 4.0,
+ 473 |             ),
+ 474 |             (
+ 475 |                 frame.cpu_pct > 90.0,
+ 476 |                 AlertSeverity.CRITICAL,
+ 477 |                 "CPU_SATURATION",
+ 478 |                 f"CPU utilization reached {frame.cpu_pct:.1f}%",
+ 479 |                 frame.cpu_pct,
+ 480 |                 90.0,
+ 481 |             ),
+ 482 |             (
+ 483 |                 frame.queue_depth > 1500,
+ 484 |                 AlertSeverity.WARN,
+ 485 |                 "QUEUE_BACKPRESSURE",
+ 486 |                 f"Queue depth at {frame.queue_depth} items",
+ 487 |                 float(frame.queue_depth),
+ 488 |                 1500.0,
+ 489 |             ),
+ 490 |         ]
+ 491 |         for triggered, severity, code, msg, val, thresh in checks:
+ 492 |             if triggered and self._can_emit(frame.node_id, code, frame.tick):
+ 493 |                 ev = AlertEvent(
+ 494 |                     alert_id=f"alr-{uuid.uuid4().hex[:10]}",
+ 495 |                     timestamp_utc=frame.timestamp_utc,
+ 496 |                     tick=frame.tick,
+ 497 |                     node_id=frame.node_id,
+ 498 |                     severity=severity,
+ 499 |                     code=code,
+ 500 |                     message=msg,
+ 501 |                     metric_value=round(val, 3),
+ 502 |                     threshold=round(thresh, 3),
+ 503 |                 )
+ 504 |                 emitted.append(ev)
+ 505 |                 self.history.append(ev)
+ 506 |         return emitted
+ 507 | 
+ 508 | 
+ 509 | class LoadBalancer:
+ 510 |     """Computes weight adjustments to smooth CPU and queue skew across healthy nodes."""
+ 511 | 
+ 512 |     def __init__(self, ring: ConsistentHashRing, min_weight: float = 0.25, max_weight: float = 2.00) -> None:
+ 513 |         self.ring = ring
+ 514 |         self.min_weight = min_weight
+ 515 |         self.max_weight = max_weight
+ 516 | 
+ 517 |     def compute_rebalance(self, tick: int, nodes: Dict[str, GridNode]) -> List[RebalancePlan]:
+ 518 |         healthy = [
+ 519 |             n for n in nodes.values()
+ 520 |             if n.state in (NodeState.HEALTHY, NodeState.DEGRADED)
+ 521 |         ]
+ 522 |         if len(healthy) < 2:
+ 523 |             return []
+ 524 | 
+ 525 |         avg_cpu = sum(n.cpu_pct for n in healthy) / len(healthy)
+ 526 |         plans: List[RebalancePlan] = []
+ 527 | 
+ 528 |         overloaded = sorted(
+ 529 |             [n for n in healthy if n.cpu_pct > avg_cpu + 12.0],
+ 530 |             key=lambda n: n.cpu_pct,
+ 531 |             reverse=True,
+ 532 |         )
+ 533 |         underloaded = sorted(
+ 534 |             [n for n in healthy if n.cpu_pct < avg_cpu - 12.0],
+ 535 |             key=lambda n: n.cpu_pct,
+ 536 |         )
+ 537 | 
+ 538 |         for src, dst in zip(overloaded, underloaded):
+ 539 |             delta = 0.15
+ 540 |             new_src_w = max(self.min_weight, round(src.weight - delta, 2))
+ 541 |             new_dst_w = min(self.max_weight, round(dst.weight + delta, 2))
+ 542 |             if new_src_w != src.weight and new_dst_w != dst.weight:
+ 543 |                 src.weight = new_src_w
+ 544 |                 dst.weight = new_dst_w
+ 545 |                 self.ring.set_weight(src.node_id, new_src_w)
+ 546 |                 self.ring.set_weight(dst.node_id, new_dst_w)
+ 547 |                 plans.append(
+ 548 |                     RebalancePlan(
+ 549 |                         plan_id=f"reb-{tick:06d}-{src.node_id}->{dst.node_id}",
+ 550 |                         tick=tick,
+ 551 |                         source_node=src.node_id,
+ 552 |                         target_node=dst.node_id,
+ 553 |                         weight_delta=delta,
+ 554 |                         reason=f"CPU skew {src.cpu_pct:.1f}% vs {dst.cpu_pct:.1f}% (avg {avg_cpu:.1f}%)",
+ 555 |                     )
+ 556 |                 )
+ 557 |         return plans
+ 558 | 
+ 559 | 
+ 560 | class TelemetryBuffer:
+ 561 |     """Thread/coroutine-friendly bounded ring buffer for recent telemetry frames."""
+ 562 | 
+ 563 |     def __init__(self, capacity: int = 4096) -> None:
+ 564 |         self.capacity = capacity
+ 565 |         self._frames: Deque[TelemetryFrame] = deque(maxlen=capacity)
+ 566 |         self._dropped: int = 0
+ 567 | 
+ 568 |     def append_batch(self, frames: Iterable[TelemetryFrame]) -> int:
+ 569 |         added = 0
+ 570 |         for frame in frames:
+ 571 |             if len(self._frames) >= self.capacity:
+ 572 |                 self._dropped += 1
+ 573 |             self._frames.append(frame)
+ 574 |             added += 1
+ 575 |         return added
+ 576 | 
+ 577 |     def latest(self, count: int = 24) -> List[TelemetryFrame]:
+ 578 |         if count <= 0:
+ 579 |             return []
+ 570 |         items = list(self._frames)
+ 581 |         return items[-count:]
+ 582 | 
+ 583 |     def stats(self) -> Dict[str, int]:
+ 584 |         return {
+ 585 |             "buffered": len(self._frames),
+ 586 |             "capacity": self.capacity,
+ 587 |             "dropped": self._dropped,
+ 588 |         }
+ 589 | 
+ 590 | 
+ 591 | class GridClusterController:
+ 592 |     """Coordinates nodes, routing ring, alerts, load balancing, and snapshots."""
+ 593 | 
+ 594 |     def __init__(self, config: GridConfig) -> None:
+ 595 |         config.validate()
+ 596 |         self.config = config
+ 597 |         self.rng = random.Random(config.seed)
+ 598 |         self.ring = ConsistentHashRing(replicas=128)
+ 599 |         self.alerts = AlertEngine(
+ 600 |             latency_sla_ms=config.latency_sla_ms,
+ 601 |             error_budget_pct=config.error_budget_pct,
+ 602 |         )
+ 603 |         self.balancer = LoadBalancer(self.ring)
+ 604 |         self.buffer = TelemetryBuffer(capacity=config.max_queue)
+ 605 |         self.nodes: Dict[str, GridNode] = {}
+ 606 |         self.tick_count: int = 0
+ 607 |         self.rebalance_log: List[RebalancePlan] = []
+ 608 |         self.snapshots: List[Dict[str, Any]] = []
+ 609 |         self._hooks: List[Callable[[int, List[TelemetryFrame]], Coroutine[Any, Any, None]]] = []
+ 610 |         self._init_nodes()
+ 611 | 
+ 612 |     def _init_nodes(self) -> None:
+ 613 |         zones = [f"{self.config.region}{suffix}" for suffix in ("a", "b", "c")]
+ 614 |         for idx in range(self.config.node_count):
+ 615 |             zone = zones[idx % len(zones)]
+ 616 |             node_id = f"node-{idx:03d}"
+ 617 |             cap = self.rng.choice([1000.0, 1200.0, 1500.0])
+ 618 |             node = GridNode(node_id=node_id, zone=zone, rng=self.rng, capacity_rps=cap)
+ 619 |             self.nodes[node_id] = node
+ 620 |             self.ring.add_node(node_id, weight=1.0)
+ 621 | 
+ 622 |     def register_hook(self, hook: Callable[[int, List[TelemetryFrame]], Coroutine[Any, Any, None]]) -> None:
+ 623 |         self._hooks.append(hook)
+ 624 | 
+ 625 |     def route_partition(self, partition_key: str) -> Optional[str]:
+ 626 |         primary = self.ring.lookup(partition_key)
+ 627 |         if primary and primary in self.nodes:
+ 628 |             node = self.nodes[primary]
+ 629 |             if node.state in (NodeState.HEALTHY, NodeState.DEGRADED):
+ 630 |                 return primary
+ 631 |         for candidate in sorted(self.nodes.values(), key=lambda n: n.cpu_pct):
+ 632 |             if candidate.state == NodeState.HEALTHY:
+ 633 |                 return candidate.node_id
+ 634 |         return primary
+ 635 | 
+ 636 |     def build_snapshot(self) -> Dict[str, Any]:
+ 637 |         active = list(self.nodes.values())
+ 638 |         total_rps = round(sum(n.rps for n in active), 2)
+ 639 |         avg_cpu = round(sum(n.cpu_pct for n in active) / max(1, len(active)), 2)
+ 640 |         avg_mem = round(sum(n.mem_pct for n in active) / max(1, len(active)), 2)
+ 641 |         max_p99 = round(max((n.p99_ms for n in active), default=0.0), 2)
+ 642 |         state_counts: Dict[str, int] = {}
+ 643 |         for st in NodeState:
+ 644 |             state_counts[st.value] = sum(1 for n in active if n.state == st)
+ 645 |         return {
+ 646 |             "schema_version": SCHEMA_VERSION,
+ 647 |             "region": self.config.region,
+ 648 |             "tick": self.tick_count,
+ 649 |             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+ 650 |             "total_rps": total_rps,
+ 651 |             "avg_cpu_pct": avg_cpu,
+ 652 |             "avg_mem_pct": avg_mem,
+ 653 |             "max_p99_ms": max_p99,
+ 654 |             "state_counts": state_counts,
+ 655 |             "buffer": self.buffer.stats(),
+ 656 |             "alerts_total": len(self.alerts.history),
+ 657 |         }
+ 658 | 
+ 659 |     async def step_once(self) -> List[TelemetryFrame]:
+ 660 |         self.tick_count += 1
+ 661 |         dt_sec = self.config.tick_ms / 1000.0
+ 662 |         frames: List[TelemetryFrame] = []
+ 663 | 
+ 664 |         for node in self.nodes.values():
+ 665 |             frame = node.step(self.tick_count, dt_sec, self.config.profile)
+ 666 |             frames.append(frame)
+ 667 |             new_alerts = self.alerts.evaluate(frame)
+ 668 |             for alr in new_alerts:
+ 669 |                 LOGGER.warning(
+ 670 |                     "[tick=%d node=%s sev=%s code=%s] %s",
+ 671 |                     alr.tick,
+ 672 |                     alr.node_id,
+ 673 |                     alr.severity.value,
+ 674 |                     alr.code,
+ 675 |                     alr.message,
+ 676 |                 )
+ 677 | 
+ 678 |         self.buffer.append_batch(frames)
+ 679 | 
+ 680 |         if self.config.enable_auto_rebalance and (self.tick_count % 6 == 0):
+ 681 |             plans = self.balancer.compute_rebalance(self.tick_count, self.nodes)
+ 682 |             self.rebalance_log.extend(plans)
+ 683 | 
+ 684 |         if self.tick_count % self.config.snapshot_interval_ticks == 0:
+ 685 |             snap = self.build_snapshot()
+ 686 |             self.snapshots.append(snap)
+ 687 | 
+ 688 |         for hook in self._hooks:
+ 689 |             await hook(self.tick_count, frames)
+ 690 | 
+ 691 |         return frames
+ 692 | 
+ 693 |     async def run_for_ticks(self, total_ticks: int, stop_event: Optional[asyncio.Event] = None) -> Dict[str, Any]:
+ 694 |         sleep_sec = self.config.tick_ms / 1000.0
+ 695 |         for _ in range(total_ticks):
+ 696 |             if stop_event is not None and stop_event.is_set():
+ 697 |                 break
+ 698 |             await self.step_once()
+ 699 |             await asyncio.sleep(sleep_sec)
+ 700 |         return self.summarize()
+ 701 | 
+ 702 |     def summarize(self) -> Dict[str, Any]:
+ 703 |         total_reqs = sum(n.total_requests for n in self.nodes.values())
+ 704 |         total_errs = sum(n.total_errors for n in self.nodes.values())
+ 705 |         err_pct = (total_errs / total_reqs * 100.0) if total_reqs > 0 else 0.0
+ 706 |         p99_peaks = [n.latency_win.percentile(99.0) for n in self.nodes.values() if n.latency_win.samples]
+ 707 |         cluster_p99 = round(max(p99_peaks, default=0.0), 2)
+ 708 |         return {
+ 709 |             "schema_version": SCHEMA_VERSION,
+ 710 |             "region": self.config.region,
+ 711 |             "profile": self.config.profile.value,
+ 712 |             "ticks_executed": self.tick_count,
+ 713 |             "nodes": len(self.nodes),
+ 714 |             "total_requests": total_reqs,
+ 715 |             "total_errors": total_errs,
+ 716 |             "overall_error_rate_pct": round(err_pct, 4),
+ 717 |             "cluster_p99_ms": cluster_p99,
+ 718 |             "rebalance_actions": len(self.rebalance_log),
+ 719 |             "alerts_emitted": len(self.alerts.history),
+ 720 |             "snapshots_captured": len(self.snapshots),
+ 721 |             "ring_distribution_pct": self.ring.distribution_stats(),
+ 722 |         }
+ 723 | 
+ 724 | 
+ 725 | def sample_partition_keys(count: int, rng: random.Random) -> List[str]:
+ 726 |     tenants = ["acme-prod", "globex-eu", "initech-ap", "soylent-us", "umbrella-core"]
+ 727 |     keys: List[str] = []
+ 728 |     for idx in range(count):
+ 729 |         tenant = rng.choice(tenants)
+ 730 |         bucket = rng.randint(0, 1023)
+ 731 |         keys.append(f"{tenant}:shard-{bucket:04d}:{idx}")
+ 732 |     return keys
+ 733 | 
+ 734 | 
+ 735 | def verify_frame_integrity(frames: Iterable[TelemetryFrame]) -> Tuple[int, int]:
+ 736 |     valid = 0
+ 737 |     invalid = 0
+ 738 |     for frame in frames:
+ 739 |         if frame.compute_checksum() == frame.checksum:
+ 740 |             valid += 1
+ 741 |         else:
+ 742 |             invalid += 1
+ 743 |     return valid, invalid
+ 744 | 
+ 745 | 
+ 746 | def format_status_table(nodes: Dict[str, GridNode]) -> str:
+ 747 |     header = (
+ 748 |         f"{'NODE':<10} {'ZONE':<12} {'STATE':<12} {'WGT':>5} "
+ 749 |         f"{'CPU%':>6} {'MEM%':>6} {'QDEP':>6} {'RPS':>8} {'P99ms':>7} {'ERR%':>7}"
+ 750 |     )
+ 751 |     sep = "-" * len(header)
+ 752 |     lines = [header, sep]
+ 753 |     for node_id in sorted(nodes.keys()):
+ 754 |         n = nodes[node_id]
+ 755 |         lines.append(
+ 756 |             f"{n.node_id:<10} {n.zone:<12} {n.state.value:<12} {n.weight:>5.2f} "
+ 757 |             f"{n.cpu_pct:>6.1f} {n.mem_pct:>6.1f} {n.queue_depth:>6d} {n.rps:>8.1f} "
+ 758 |             f"{n.p99_ms:>7.1f} {n.error_rate_pct:>7.3f}"
+ 759 |         )
+ 760 |     return "\n".join(lines)
+ 761 | 
+ 762 | 
+ 763 | def write_report(report_path: Path, summary: Dict[str, Any], snapshots: List[Dict[str, Any]]) -> None:
+ 764 |     report_path.parent.mkdir(parents=True, exist_ok=True)
+ 765 |     payload = {
+ 766 |         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+ 767 |         "summary": summary,
+ 768 |         "snapshots": snapshots,
+ 769 |     }
+ 770 |     tmp_path = report_path.with_suffix(report_path.suffix + ".tmp")
+ 771 |     with tmp_path.open("w", encoding="utf-8") as handle:
+ 772 |         json.dump(payload, handle, indent=2, sort_keys=True)
+ 773 |         handle.write("\n")
+ 774 |     os.replace(tmp_path, report_path)
+ 775 | 
+ 776 | 
+ 777 | def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+ 778 |     parser = argparse.ArgumentParser(
+ 779 |         prog="nexus_grid_sim",
+ 780 |         description="Run synthetic distributed telemetry and grid orchestration simulation.",
+ 781 |     )
+ 782 |     parser.add_argument("--region", default=DEFAULT_REGION, help="Target deployment region")
+ 783 |     parser.add_argument("--nodes", type=int, default=24, help="Number of simulated grid nodes")
+ 784 |     parser.add_argument("--ticks", type=int, default=80, help="Number of simulation ticks to run")
+ 785 |     parser.add_argument("--tick-ms", type=int, default=DEFAULT_TICK_MS, help="Tick interval in milliseconds")
+ 786 |     parser.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Deterministic PRNG seed")
+ 787 |     parser.add_argument(
+ 788 |         "--profile",
+ 789 |         choices=[p.value for p in WorkloadProfile],
+ 790 |         default=WorkloadProfile.DIURNAL.value,
+ 791 |         help="Synthetic traffic workload profile",
+ 792 |     )
+ 793 |     parser.add_argument("--sla-ms", type=float, default=145.0, help="Target p99 latency SLA in ms")
+ 794 |     parser.add_argument("--error-budget", type=float, default=0.50, help="Error budget threshold in %")
+ 795 |     parser.add_argument("--no-rebalance", action="store_true", help="Disable automatic weight rebalancing")
+ 796 |     parser.add_argument("--output", type=Path, default=None, help="Optional JSON report output path")
+ 797 |     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
+ 798 |     return parser.parse_args(argv)
+ 799 | 
+ 800 | 
+ 801 | def configure_logging(verbose: bool) -> None:
+ 802 |     level = logging.DEBUG if verbose else logging.INFO
+ 803 |     logging.basicConfig(
+ 804 |         level=level,
+ 805 |         format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+ 806 |         datefmt="%Y-%m-%dT%H:%M:%S",
+ 807 |     )
+ 808 | 
+ 809 | 
+ 810 | async def _async_main(args: argparse.Namespace) -> int:
+ 811 |     config = GridConfig(
+ 812 |         region=args.region,
+ 813 |         node_count=args.nodes,
+ 814 |         tick_ms=args.tick_ms,
+ 815 |         seed=args.seed,
+ 816 |         profile=WorkloadProfile(args.profile),
+ 817 |         latency_sla_ms=args.sla_ms,
+ 818 |         error_budget_pct=args.error_budget,
+ 819 |         enable_auto_rebalance=not args.no_rebalance,
+ 820 |         output_path=args.output,
+ 821 |     )
+ 822 |     controller = GridClusterController(config)
+ 823 |     stop_event = asyncio.Event()
+ 824 | 
+ 825 |     loop = asyncio.get_running_loop()
+ 826 |     for sig in (signal.SIGINT, signal.SIGTERM):
+ 827 |         try:
+ 828 |             loop.add_signal_handler(sig, stop_event.set)
+ 829 |         except NotImplementedError:
+ 830 |             pass
+ 831 | 
+ 832 |     async def _audit_hook(tick: int, frames: List[TelemetryFrame]) -> None:
+ 833 |         if tick % 20 == 0:
+ 834 |             ok, bad = verify_frame_integrity(frames)
+ 835 |             LOGGER.debug("Tick %d frame integrity check: valid=%d invalid=%d", tick, ok, bad)
+ 836 | 
+ 837 |     controller.register_hook(_audit_hook)
+ 838 |     summary = await controller.run_for_ticks(args.ticks, stop_event=stop_event)
+ 839 | 
+ 840 |     sample_keys = sample_partition_keys(16, random.Random(config.seed + 99))
+ 841 |     routed = {key: controller.route_partition(key) for key in sample_keys}
+ 842 |     summary["sample_routes"] = routed
+ 843 | 
+ 844 |     print(format_status_table(controller.nodes))
+ 845 |     print("\n--- CLUSTER SUMMARY ---")
+ 846 |     print(json.dumps(summary, indent=2))
+ 847 | 
+ 848 |     if config.output_path is not None:
+ 849 |         write_report(config.output_path, summary, controller.snapshots)
+ 850 |         LOGGER.info("Wrote simulation report to %s", config.output_path)
+ 851 | 
+ 852 |     return 0
+ 853 | 
+ 854 | 
+ 855 | def main(argv: Optional[List[str]] = None) -> int:
+ 856 |     args = parse_args(argv)
+ 857 |     configure_logging(args.verbose)
+ 858 |     try:
+ 859 |         return asyncio.run(_async_main(args))
+ 860 |     except KeyboardInterrupt:
+ 861 |         LOGGER.info("Interrupted by user; shutting down cleanly.")
+ 862 |         return 130
+ 863 |     except ValueError as exc:
+ 864 |         LOGGER.error("Configuration error: %s", exc)
+ 865 |         return 2
+ 866 | 
+ 867 | 
+ 868 | # --- Synthetic Scenario Presets & Diagnostic Helpers ---
+ 869 | 
+ 870 | SCENARIO_PRESETS: Dict[str, Dict[str, Any]] = {
+ 871 |     "baseline_calm": {
+ 872 |         "node_count": 12,
+ 873 |         "ticks": 40,
+ 874 |         "profile": WorkloadProfile.STEADY.value,
+ 875 |         "sla_ms": 180.0,
+ 876 |     },
+ 877 |     "prime_time_surge": {
+ 878 |         "node_count": 32,
+ 879 |         "ticks": 120,
+ 880 |         "profile": WorkloadProfile.DIURNAL.value,
+ 881 |         "sla_ms": 140.0,
+ 882 |     },
+ 883 |     "flash_sale_burst": {
+ 884 |         "node_count": 24,
+ 885 |         "ticks": 90,
+ 886 |         "profile": WorkloadProfile.BURSTY.value,
+ 887 |         "sla_ms": 150.0,
+ 888 |     },
+ 889 |     "game_day_chaos": {
+ 890 |         "node_count": 20,
+ 891 |         "ticks": 100,
+ 892 |         "profile": WorkloadProfile.CHAOS.value,
+ 893 |         "sla_ms": 125.0,
+ 894 |     },
+ 895 | }
+ 896 | 
+ 897 | 
+ 898 | def run_preset(preset_name: str, seed_offset: int = 0) -> Dict[str, Any]:
+ 899 |     if preset_name not in SCENARIO_PRESETS:
+ 900 |         known = ", ".join(sorted(SCENARIO_PRESETS.keys()))
+ 901 |         raise KeyError(f"Unknown preset '{preset_name}'. Expected one of: {known}")
+ 902 |     spec = SCENARIO_PRESETS[preset_name]
+ 903 |     cfg = GridConfig(
+ 904 |         node_count=int(spec["node_count"]),
+ 905 |         tick_ms=20,
+ 906 |         seed=DEFAULT_SEED + seed_offset,
+ 907 |         profile=WorkloadProfile(str(spec["profile"])),
+ 908 |         latency_sla_ms=float(spec["sla_ms"]),
+ 909 |         enable_auto_rebalance=True,
+ 910 |     )
+ 911 |     ctrl = GridClusterController(cfg)
+ 912 |     return asyncio.run(ctrl.run_for_ticks(int(spec["ticks"])))
+ 913 | 
+ 914 | 
+ 915 | def run_all_presets() -> Dict[str, Dict[str, Any]]:
+ 916 |     results: Dict[str, Dict[str, Any]] = {}
+ 917 |     for idx, name in enumerate(SCENARIO_PRESETS.keys()):
+ 918 |         results[name] = run_preset(name, seed_offset=idx * 101)
+ 919 |     return results
+ 920 | 
+ 921 | 
+ 922 | def top_hottest_nodes(nodes: Dict[str, GridNode], limit: int = 5) -> List[Tuple[str, float, float]]:
+ 923 |     ranked = sorted(
+ 924 |         ((n.node_id, n.cpu_pct, n.p99_ms) for n in nodes.values()),
+ 925 |         key=lambda item: (item[1], item[2]),
+ 926 |         reverse=True,
+ 927 |     )
+ 928 |     return ranked[: max(0, limit)]
+ 929 | 
+ 930 | 
+ 931 | def export_frames_jsonl(frames: Iterable[TelemetryFrame], out_file: Path) -> int:
+ 932 |     out_file.parent.mkdir(parents=True, exist_ok=True)
+ 933 |     written = 0
+ 934 |     with out_file.open("w", encoding="utf-8") as handle:
+ 935 |         for frame in frames:
+ 936 |             row = asdict(frame)
+ 937 |             row["state"] = frame.state.value
+ 938 |             handle.write(json.dumps(row, separators=(",", ":")) + "\n")
+ 939 |             written += 1
+ 940 |     return written
+ 941 | 
+ 942 | 
+ 943 | def compute_cluster_health_score(summary: Dict[str, Any]) -> float:
+ 944 |     err_rate = float(summary.get("overall_error_rate_pct", 0.0))
+ 945 |     p99 = float(summary.get("cluster_p99_ms", 0.0))
+ 946 |     alerts = int(summary.get("alerts_emitted", 0))
+ 947 |     nodes = max(1, int(summary.get("nodes", 1)))
+ 948 |     penalty = (err_rate * 14.0) + (max(0.0, p99 - 100.0) * 0.08) + ((alerts / nodes) * 4.5)
+ 949 |     score = 100.0 - penalty
+ 950 |     return round(max(0.0, min(100.0, score)), 2)
+ 951 | 
+ 952 | 
+ 953 | def print_health_banner(summary: Dict[str, Any]) -> None:
+ 954 |     score = compute_cluster_health_score(summary)
+ 955 |     grade = "A" if score >= 90 else "B" if score >= 75 else "C" if score >= 60 else "D"
+ 956 |     print(f"Cluster Health Score: {score:.2f}/100 (Grade {grade})")
+ 957 | 
+ 958 | 
+ 959 | def dry_run_self_check() -> bool:
+ 960 |     cfg = GridConfig(node_count=4, tick_ms=10, seed=12345, profile=WorkloadProfile.STEADY)
+ 961 |     ctrl = GridClusterController(cfg)
+ 962 |     summary = asyncio.run(ctrl.run_for_ticks(5))
+ 963 |     ok, bad = verify_frame_integrity(ctrl.buffer.latest(20))
+ 964 |     return summary["ticks_executed"] == 5 and bad == 0 and ok > 0
+ 975 | 
+ 976 | 
+ 977 | def _bench_ring_lookup(iterations: int = 5000) -> float:
+ 978 |     ring = ConsistentHashRing(replicas=64)
+ 979 |     for i in range(16):
+ 980 |         ring.add_node(f"bench-node-{i:02d}", weight=1.0)
+ 981 |     start = time.perf_counter()
+ 982 |     for i in range(iterations):
+ 983 |         ring.lookup(f"tenant-key-{i % 256}")
+ 984 |     elapsed_ms = (time.perf_counter() - start) * 1000.0
+ 985 |     return round(elapsed_ms, 3)
+ 986 | 
+ 987 | 
+ 988 | def _format_duration_ms(ms: float) -> str:
+ 989 |     if ms < 1000.0:
+ 990 |         return f"{ms:.1f}ms"
+ 991 |     return f"{ms / 1000.0:.2f}s"
+ 992 | 
+ 993 | 
+ 994 | def _version_banner() -> str:
+ 995 |     return f"nexus_grid_sim v{SCHEMA_VERSION} (synthetic telemetry harness)"
+ 996 | 
+ 997 | 
+ 998 | if __name__ == "__main__":
+ 999 |     assert dry_run_self_check(), "Self-check failed"
+1000 |     sys.exit(main())
